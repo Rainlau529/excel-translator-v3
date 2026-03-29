@@ -11,24 +11,16 @@ TASKS = {}
 TASKS_LOCK = threading.Lock()
 TASK_RETENTION_SECONDS = 1800
 
-# ====== 限速+重试翻译（已增强，每个请求后 sleep 2 秒） ======
 def translate_text(text: str) -> str:
     if not text or not text.strip():
         return ""
-
     text = text[:5000]
-
     url = "https://translate.googleapis.com/translate_a/single"
     params = dict(client="gtx", sl="auto", tl="zh", dt="t", q=text)
-
-    headers = {
-        "User-Agent": "Mozilla/5.0"
-    }
-
+    headers = {"User-Agent": "Mozilla/5.0"}
     for attempt in range(1, 4):
         try:
             r = requests.get(url, params=params, headers=headers, timeout=15)
-
             if r.status_code == 200:
                 data = r.json()
                 if data and data[0]:
@@ -36,19 +28,13 @@ def translate_text(text: str) -> str:
                 else:
                     print("⚠️ 翻译返回空数据:", text)
                     return text
-
             else:
                 print("⚠️ 状态码异常:", r.status_code)
-
         except Exception as e:
-            print("❌ 翻译报错！！！", e)
-
+            print("❌ 翻译报错:", e)
         time.sleep((2 ** attempt) + 0.5)
-
     return text
 
-
-# ====== 任务/状态工具 ======
 def _safe_update(task_id: str, kv: dict):
     with TASKS_LOCK:
         st = TASKS.get(task_id)
@@ -66,8 +52,6 @@ def _schedule_state_cleanup(task_id: str):
             TASKS.pop(task_id, None)
     threading.Thread(target=_cleanup, daemon=True).start()
 
-
-# ====== 核心任务 ======
 def _run_task(file_path: str, task_id: str):
     _safe_update(task_id, {"status": "running", "message": "读取文件...", "percent": 0, "started_at": time.time()})
     start_time = time.time()
@@ -76,7 +60,6 @@ def _run_task(file_path: str, task_id: str):
         ws = wb.active
         if not ws:
             raise ValueError("空工作表")
-
         # 找 Title 列
         title_col_idx = None
         for idx, cell in enumerate(ws[1], 1):
@@ -85,75 +68,50 @@ def _run_task(file_path: str, task_id: str):
                 break
         if not title_col_idx:
             raise ValueError("找不到 Title 列")
-
         # 插入中文列
         insert_idx = title_col_idx + 1
         if ws.cell(row=1, column=insert_idx).value != "中文":
             ws.insert_cols(insert_idx)
             ws.cell(row=1, column=insert_idx, value="中文")
-
         # 待翻译行
         rows_to_tr = [r for r in range(2, ws.max_row + 1)
                       if str(ws.cell(row=r, column=title_col_idx).value).strip()]
         total = len(rows_to_tr)
         _safe_update(task_id, {"total": total, "current": 0})
-
         if total == 0:
             _safe_update(task_id, {"status": "done", "percent": 100, "message": "无需翻译"})
             return
-
-        BATCH = 10
+        BATCH = 5  # 减小批大小，更平滑
         start = time.time()
-
-        # 输出文件路径（英文名）
-        output_path = os.path.join(
-            "/tmp",
-            os.path.splitext(os.path.basename(file_path))[0] + "_translated.xlsx"
-        )
-
+        output_path = os.path.join("/tmp", os.path.splitext(os.path.basename(file_path))[0] + "_translated.xlsx")
         for batch_start in range(0, total, BATCH):
             if _get_state(task_id).get("cancel_requested"):
                 _safe_update(task_id, {"status": "canceled", "message": "已取消"})
                 return
-
             batch_rows = rows_to_tr[batch_start:batch_start + BATCH]
-
             for done_in_batch, row in enumerate(batch_rows, 1):
                 title_cell = ws.cell(row=row, column=title_col_idx)
                 original_text = str(title_cell.value)
                 translated = translate_text(original_text)
-
                 if not translated:
                     translated = original_text
-
                 ws.cell(row=row, column=insert_idx, value=translated)
-
                 done_total = batch_start + done_in_batch
                 elapsed = max(time.time() - start, 1e-6)
                 eta = int((total - done_total) / (done_total / elapsed)) if done_total else 0
                 percent = int(done_total * 100 / total)
-
                 _safe_update(task_id, {
                     "current": done_total,
                     "percent": percent,
                     "eta_seconds": eta,
                     "message": f"翻译中({done_total}/{total})"
                 })
-
-                # 每个翻译后等待 2 秒（避免 429）
-                time.sleep(2)
-
-            # 每批保存一次
+                # 每个翻译后等待 5 秒（关键！）
+                time.sleep(5)
             wb.save(output_path)
-            # 每批后额外等待 5 秒
-            time.sleep(5)
-
-        # 最终保存
+            time.sleep(10)  # 每批后多休息
         wb.save(output_path)
-
-        print(f"[DEBUG] 文件保存路径: {output_path}")
-        print(f"[DEBUG] 文件是否存在: {os.path.exists(output_path)}, 大小: {os.path.getsize(output_path) if os.path.exists(output_path) else 0}")
-
+        print(f"[DEBUG] 文件保存: {output_path}, 大小: {os.path.getsize(output_path)}")
         _safe_update(task_id, {
             "status": "done",
             "percent": 100,
@@ -163,11 +121,9 @@ def _run_task(file_path: str, task_id: str):
             "finished_at": time.time(),
             "duration_seconds": int(time.time() - start_time)
         })
-
     except Exception as e:
         print("❌ 任务整体报错:", e)
         _safe_update(task_id, {"status": "error", "message": str(e), "finished_at": time.time(), "duration_seconds": int(time.time() - start_time)})
-
     finally:
         try:
             base = os.path.dirname(file_path)
@@ -177,8 +133,6 @@ def _run_task(file_path: str, task_id: str):
             pass
         _schedule_state_cleanup(task_id)
 
-
-# ====== 路由 ======
 def start_background_task(file_path: str, filename: str) -> str:
     task_id = uuid.uuid4().hex[:12]
     with TASKS_LOCK:
@@ -194,7 +148,6 @@ def start_background_task(file_path: str, filename: str) -> str:
     threading.Thread(target=_run_task, args=(file_path, task_id), daemon=True).start()
     return task_id
 
-
 def sse_progress(task_id: str):
     def gen():
         while True:
@@ -202,7 +155,6 @@ def sse_progress(task_id: str):
             if not st:
                 yield f"data: {json.dumps({'status':'error','message':'任务不存在'})}\n\n"
                 break
-
             payload = {
                 "task_id": task_id,
                 "status": st.get("status"),
@@ -216,17 +168,14 @@ def sse_progress(task_id: str):
                 "duration_seconds": st.get("duration_seconds")
             }
             yield f"event: progress\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
-
             if st.get("status") in ("done", "error", "canceled"):
                 break
             time.sleep(0.2)
     return Response(gen(), mimetype="text/event-stream")
 
-
 @app.route('/')
 def index():
     return render_template('index.html')
-
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
@@ -235,7 +184,6 @@ def upload_file():
         return jsonify({'error': '没有选择文件'}), 400
     if not file.filename.endswith('.xlsx'):
         return jsonify({'error': '请上传Excel文件(.xlsx)'}), 400
-
     try:
         filename = secure_filename(file.filename)
         temp_dir = tempfile.mkdtemp()
@@ -246,17 +194,14 @@ def upload_file():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-
 @app.route('/progress/<task_id>')
 def progress(task_id):
     return sse_progress(task_id)
-
 
 @app.route('/tasks/<task_id>', methods=['GET'])
 def task_status(task_id):
     st = _get_state(task_id)
     return jsonify(st) if st else (jsonify({'error': '任务不存在'}), 404)
-
 
 @app.route('/download/<filename>')
 def download_file(filename):
@@ -271,7 +216,6 @@ def download_file(filename):
     except Exception as e:
         print(f"下载异常: {e}")
         return "下载失败", 500
-
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
