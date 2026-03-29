@@ -11,7 +11,7 @@ TASKS = {}
 TASKS_LOCK = threading.Lock()
 TASK_RETENTION_SECONDS = 1800
 
-# ====== 限速+重试翻译（已增强） ======
+# ====== 限速+重试翻译（已增强，每个请求后 sleep 2 秒） ======
 def translate_text(text: str) -> str:
     if not text or not text.strip():
         return ""
@@ -35,7 +35,7 @@ def translate_text(text: str) -> str:
                     return "".join(seg[0] for seg in data[0])
                 else:
                     print("⚠️ 翻译返回空数据:", text)
-                    return text  # 返回原文
+                    return text
 
             else:
                 print("⚠️ 状态码异常:", r.status_code)
@@ -45,7 +45,6 @@ def translate_text(text: str) -> str:
 
         time.sleep((2 ** attempt) + 0.5)
 
-    # 最终兜底：返回原文
     return text
 
 
@@ -68,7 +67,7 @@ def _schedule_state_cleanup(task_id: str):
     threading.Thread(target=_cleanup, daemon=True).start()
 
 
-# ====== 核心：每翻译一行sleep 1秒，每批额外sleep 3秒，文件名英文 ======
+# ====== 核心任务 ======
 def _run_task(file_path: str, task_id: str):
     _safe_update(task_id, {"status": "running", "message": "读取文件...", "percent": 0, "started_at": time.time()})
     start_time = time.time()
@@ -78,7 +77,7 @@ def _run_task(file_path: str, task_id: str):
         if not ws:
             raise ValueError("空工作表")
 
-        # 1. 找 Title 列
+        # 找 Title 列
         title_col_idx = None
         for idx, cell in enumerate(ws[1], 1):
             if str(cell.value).strip().lower() == "title":
@@ -87,13 +86,13 @@ def _run_task(file_path: str, task_id: str):
         if not title_col_idx:
             raise ValueError("找不到 Title 列")
 
-        # 2. 插入中文列
+        # 插入中文列
         insert_idx = title_col_idx + 1
         if ws.cell(row=1, column=insert_idx).value != "中文":
             ws.insert_cols(insert_idx)
             ws.cell(row=1, column=insert_idx, value="中文")
 
-        # 3. 待翻译行
+        # 待翻译行
         rows_to_tr = [r for r in range(2, ws.max_row + 1)
                       if str(ws.cell(row=r, column=title_col_idx).value).strip()]
         total = len(rows_to_tr)
@@ -106,14 +105,13 @@ def _run_task(file_path: str, task_id: str):
         BATCH = 10
         start = time.time()
 
-        # 输出文件路径（使用英文名）
+        # 输出文件路径（英文名）
         output_path = os.path.join(
             "/tmp",
             os.path.splitext(os.path.basename(file_path))[0] + "_translated.xlsx"
         )
 
         for batch_start in range(0, total, BATCH):
-
             if _get_state(task_id).get("cancel_requested"):
                 _safe_update(task_id, {"status": "canceled", "message": "已取消"})
                 return
@@ -122,11 +120,9 @@ def _run_task(file_path: str, task_id: str):
 
             for done_in_batch, row in enumerate(batch_rows, 1):
                 title_cell = ws.cell(row=row, column=title_col_idx)
-
                 original_text = str(title_cell.value)
                 translated = translate_text(original_text)
 
-                # 防止空值
                 if not translated:
                     translated = original_text
 
@@ -144,18 +140,17 @@ def _run_task(file_path: str, task_id: str):
                     "message": f"翻译中({done_total}/{total})"
                 })
 
-                # ✅ 每个翻译请求后等待1秒，避免429
-                time.sleep(1)
+                # 每个翻译后等待 2 秒（避免 429）
+                time.sleep(2)
 
             # 每批保存一次
             wb.save(output_path)
-            # ✅ 每批之后额外等待3秒
-            time.sleep(3)
+            # 每批后额外等待 5 秒
+            time.sleep(5)
 
-        # 最终再保存一次（确保所有数据写入）
+        # 最终保存
         wb.save(output_path)
 
-        # 调试输出：确认文件存在且大小正常
         print(f"[DEBUG] 文件保存路径: {output_path}")
         print(f"[DEBUG] 文件是否存在: {os.path.exists(output_path)}, 大小: {os.path.getsize(output_path) if os.path.exists(output_path) else 0}")
 
@@ -180,14 +175,12 @@ def _run_task(file_path: str, task_id: str):
                 shutil.rmtree(base, ignore_errors=True)
         except Exception:
             pass
-
         _schedule_state_cleanup(task_id)
 
 
 # ====== 路由 ======
 def start_background_task(file_path: str, filename: str) -> str:
     task_id = uuid.uuid4().hex[:12]
-
     with TASKS_LOCK:
         TASKS[task_id] = {
             "status": "idle",
@@ -198,7 +191,6 @@ def start_background_task(file_path: str, filename: str) -> str:
             "tmp_dir": os.path.dirname(file_path),
             "filename": filename
         }
-
     threading.Thread(target=_run_task, args=(file_path, task_id), daemon=True).start()
     return task_id
 
@@ -207,7 +199,6 @@ def sse_progress(task_id: str):
     def gen():
         while True:
             st = _get_state(task_id)
-
             if not st:
                 yield f"data: {json.dumps({'status':'error','message':'任务不存在'})}\n\n"
                 break
@@ -224,14 +215,11 @@ def sse_progress(task_id: str):
                 "finished_at": st.get("finished_at"),
                 "duration_seconds": st.get("duration_seconds")
             }
-
             yield f"event: progress\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
             if st.get("status") in ("done", "error", "canceled"):
                 break
-
             time.sleep(0.2)
-
     return Response(gen(), mimetype="text/event-stream")
 
 
@@ -243,10 +231,8 @@ def index():
 @app.route('/upload', methods=['POST'])
 def upload_file():
     file = request.files.get('file')
-
     if not file or file.filename == '':
         return jsonify({'error': '没有选择文件'}), 400
-
     if not file.filename.endswith('.xlsx'):
         return jsonify({'error': '请上传Excel文件(.xlsx)'}), 400
 
@@ -254,13 +240,9 @@ def upload_file():
         filename = secure_filename(file.filename)
         temp_dir = tempfile.mkdtemp()
         file_path = os.path.join(temp_dir, filename)
-
         file.save(file_path)
-
         task_id = start_background_task(file_path, filename)
-
         return jsonify({'success': True, 'task_id': task_id}), 202
-
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -279,11 +261,16 @@ def task_status(task_id):
 @app.route('/download/<filename>')
 def download_file(filename):
     file_path = os.path.join("/tmp", filename)
-
-    if os.path.exists(file_path):
-        return send_file(file_path, as_attachment=True, download_name=filename)
-
-    return "文件不存在", 404
+    try:
+        if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+            print(f"[DEBUG] 下载文件: {file_path}, 大小: {os.path.getsize(file_path)}")
+            return send_file(file_path, as_attachment=True, download_name=filename, conditional=False)
+        else:
+            print(f"[DEBUG] 文件不存在或为空: {file_path}")
+            return "文件不存在或为空", 404
+    except Exception as e:
+        print(f"下载异常: {e}")
+        return "下载失败", 500
 
 
 if __name__ == '__main__':
