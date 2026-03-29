@@ -35,7 +35,7 @@ def translate_text(text: str) -> str:
                     return "".join(seg[0] for seg in data[0])
                 else:
                     print("⚠️ 翻译返回空数据:", text)
-                    return text  # ✅ 不再返回“翻译失败”
+                    return text  # 返回原文
 
             else:
                 print("⚠️ 状态码异常:", r.status_code)
@@ -45,7 +45,7 @@ def translate_text(text: str) -> str:
 
         time.sleep((2 ** attempt) + 0.5)
 
-    # ✅ 最终兜底：返回原文
+    # 最终兜底：返回原文
     return text
 
 
@@ -68,9 +68,10 @@ def _schedule_state_cleanup(task_id: str):
     threading.Thread(target=_cleanup, daemon=True).start()
 
 
-# ====== 核心：8 秒心跳 + 10 行 batch ======
+# ====== 核心：每翻译一行sleep 1秒，每批额外sleep 3秒，文件名英文 ======
 def _run_task(file_path: str, task_id: str):
     _safe_update(task_id, {"status": "running", "message": "读取文件...", "percent": 0, "started_at": time.time()})
+    start_time = time.time()
     try:
         wb = load_workbook(file_path)
         ws = wb.active
@@ -105,9 +106,10 @@ def _run_task(file_path: str, task_id: str):
         BATCH = 10
         start = time.time()
 
+        # 输出文件路径（使用英文名）
         output_path = os.path.join(
             "/tmp",
-            os.path.splitext(os.path.basename(file_path))[0] + "_中文翻译.xlsx"
+            os.path.splitext(os.path.basename(file_path))[0] + "_translated.xlsx"
         )
 
         for batch_start in range(0, total, BATCH):
@@ -124,7 +126,7 @@ def _run_task(file_path: str, task_id: str):
                 original_text = str(title_cell.value)
                 translated = translate_text(original_text)
 
-                # ✅ 防止空值
+                # 防止空值
                 if not translated:
                     translated = original_text
 
@@ -142,12 +144,20 @@ def _run_task(file_path: str, task_id: str):
                     "message": f"翻译中({done_total}/{total})"
                 })
 
-            # 每批保存 + 限速
-            wb.save(output_path)
-            time.sleep(3)  # ✅ 降低被封概率
+                # ✅ 每个翻译请求后等待1秒，避免429
+                time.sleep(1)
 
-        # ✅ 最终再保存一次（防止极端情况）
+            # 每批保存一次
+            wb.save(output_path)
+            # ✅ 每批之后额外等待3秒
+            time.sleep(3)
+
+        # 最终再保存一次（确保所有数据写入）
         wb.save(output_path)
+
+        # 调试输出：确认文件存在且大小正常
+        print(f"[DEBUG] 文件保存路径: {output_path}")
+        print(f"[DEBUG] 文件是否存在: {os.path.exists(output_path)}, 大小: {os.path.getsize(output_path) if os.path.exists(output_path) else 0}")
 
         _safe_update(task_id, {
             "status": "done",
@@ -155,12 +165,13 @@ def _run_task(file_path: str, task_id: str):
             "eta_seconds": 0,
             "message": f"翻译完成，共处理 {total} 行",
             "download_filename": os.path.basename(output_path),
-            "finished_at": time.time()
+            "finished_at": time.time(),
+            "duration_seconds": int(time.time() - start_time)
         })
 
     except Exception as e:
         print("❌ 任务整体报错:", e)
-        _safe_update(task_id, {"status": "error", "message": str(e), "finished_at": time.time()})
+        _safe_update(task_id, {"status": "error", "message": str(e), "finished_at": time.time(), "duration_seconds": int(time.time() - start_time)})
 
     finally:
         try:
@@ -273,3 +284,7 @@ def download_file(filename):
         return send_file(file_path, as_attachment=True, download_name=filename)
 
     return "文件不存在", 404
+
+
+if __name__ == '__main__':
+    app.run(debug=True, host='0.0.0.0', port=5000)
